@@ -1,0 +1,302 @@
+#include <Wire.h>
+#include <MPU6050.h>
+
+MPU6050 mpu;
+
+int c = 0;
+// IR sensor pins
+int ir1 = 4;
+int ir2 = 5;
+int ir3 = 6;
+int ir4 = 7;
+int ir5 = 8;
+
+// Left and right block flags
+int lblock = 1;
+int rblock = 0;
+
+// Motor driver pins
+int m1 = 9;
+int m2 = 10;
+int m3 = 11;
+int m4 = 12;
+
+// User mode selection
+int user = 2;
+int r;
+
+const int forward_speed = 240;
+const int turn_speed = 180;
+
+// Gyroscope yaw tracking
+float yaw = 0;
+unsigned long prev_time = 0;
+const float calibration_factor = 0.95; // Adjust for accuracy
+
+int turnedRight;
+int turnedLeft;
+
+// New variables for destination and return
+bool destinationReached = false;
+bool returningToStart = false;
+unsigned long stopTime = 0;
+
+
+void(* resetFunc) (void) = 0; 
+
+void setup() {
+    Serial.begin(9600);
+    Wire.begin();
+    mpu.initialize();
+
+    pinMode(2,INPUT);
+    pinMode(3,INPUT);
+    pinMode(13,OUTPUT);
+    digitalWrite(13,LOW);
+
+    // IR sensor setup
+    pinMode(ir1, INPUT);
+    pinMode(ir2, INPUT);
+    pinMode(ir3, INPUT);
+    pinMode(ir4, INPUT);
+    pinMode(ir5, INPUT);
+
+    // Motor setup
+    pinMode(m1, OUTPUT);
+    pinMode(m2, OUTPUT);
+    pinMode(m3, OUTPUT);
+    pinMode(m4, OUTPUT);
+
+pinMode(A0,OUTPUT);
+digitalWrite(A0,LOW);
+  
+    do{
+  Serial.print("waiting");
+  
+    
+    }while(digitalRead(2) == LOW && digitalRead(3) == LOW);
+    
+    // User configurations
+    if (digitalRead(2) == HIGH && digitalRead(3) == LOW) {
+      Serial.print("hi");
+        r = 0;
+        turnedRight = 1;
+        turnedLeft = 1;
+    } else if (digitalRead(3) == HIGH && digitalRead(2) == LOW) {
+
+      Serial.print("bye");
+        r = 0;
+        turnedRight = 0;
+        turnedLeft = 1;
+    } else if (digitalRead(2) == HIGH && digitalRead(3) == HIGH) {
+
+      Serial.print("lowi");
+        r = 1;
+        turnedRight = 1;
+        turnedLeft = 0;
+
+        // Correctly assigning lblock and rblock
+        lblock = 0;
+        rblock = 1;
+    // Debugging user settings
+
+    Serial.print("User: "); Serial.println(user);
+    Serial.print("lblock: "); Serial.println(lblock);
+    Serial.print("rblock: "); Serial.println(rblock);
+    Serial.print("turnedLeft: "); Serial.println(turnedLeft);
+    Serial.print("turnedRight: "); Serial.println(turnedRight);
+}
+delay(1000);
+    digitalWrite(13,HIGH);
+delay(3000);}
+
+float getYawRate() {
+    int16_t gx, gy, gz;
+    mpu.getRotation(&gx, &gy, &gz);
+    return gz / 131.0;
+}
+
+void updateYaw() {
+    unsigned long current_time = millis();
+    float dt = (current_time - prev_time) / 1000.0;
+    yaw += (getYawRate() * dt) * calibration_factor;
+    prev_time = current_time;
+}
+
+void turnRobot(int direction) {
+    yaw = 0;
+    prev_time = millis();
+
+    if (direction == 1) {
+        // Turn right
+        analogWrite(m1, turn_speed);
+        analogWrite(m2, 0);
+        analogWrite(m3, 0);
+        analogWrite(m4, turn_speed);
+    } else if (direction == -1) {
+        // Turn left
+        analogWrite(m1, 0);
+        analogWrite(m2, turn_speed);
+        analogWrite(m3, turn_speed);
+        analogWrite(m4, 0);
+    }
+
+    while (abs(yaw) < 75) {
+        updateYaw();
+        Serial.print("Yaw: ");
+        Serial.println(yaw);
+    }
+
+    // Stop after turn
+    analogWrite(m1, 0);
+    analogWrite(m2, 0);
+    analogWrite(m3, 0);
+    analogWrite(m4, 0);
+}
+
+
+void turnBack(int direction) {
+    delay(10000);
+    digitalWrite(A0, LOW);
+    Serial.println("Turning back to past position...");
+    turnRobot(-direction);
+}
+
+void returnToStart() {
+    // This function should implement the logic to return to the starting point
+    // For simplicity, we'll just make it turn around (180 degrees)
+    turnRobot(1);
+    turnRobot(1);
+    returningToStart = true;
+}
+
+void loop() {
+    if (destinationReached) {
+        if (millis() - stopTime < 10000) {
+            // Wait for 10 seconds
+            return;
+        } else if (!returningToStart) {
+            returnToStart();
+            return;
+        }
+    }
+
+    // Read sensor values
+    int val = digitalRead(ir1);
+    int valr1 = digitalRead(ir2);
+    int valr2 = digitalRead(ir3);
+    int vall1 = digitalRead(ir4);
+    int vall2 = digitalRead(ir5);
+
+
+    Serial.print("Sensors: ");
+    Serial.print(val); Serial.print(" ");
+    Serial.print(valr1); Serial.print(" ");
+    Serial.print(valr2); Serial.print(" ");
+    Serial.print(vall1); Serial.print(" ");
+    Serial.println(vall2);
+
+    // Forward movement
+ if (val == 0 && valr1 == 0 && valr2 == 0 && vall1 == 0 && vall2 == 0) {
+        if (!destinationReached && !returningToStart) {
+            Serial.println("Destination Reached");
+            analogWrite(m1, 0);
+            analogWrite(m2, 0);
+            analogWrite(m3, 0);
+            analogWrite(m4, 0);
+            destinationReached = true;
+            stopTime = millis();
+            digitalWrite(A0, HIGH);
+            delay(8000);
+            digitalWrite(A0,LOW);
+            return;
+        } else if (returningToStart) {
+
+            Serial.println("Returned to Start");
+            analogWrite(m1, 0);
+            analogWrite(m2, 0);
+            analogWrite(m3, 0);
+            analogWrite(m4, 0);
+            destinationReached = false;
+            returningToStart = false;
+            digitalWrite(1, LOW);
+
+            resetFunc();
+            delay(10000); // Wait for 10 seconds at the start position
+            return;
+        }
+    }
+
+    // Forward movement
+    if ((val == 1 && valr1 == 1 && valr2 == 0 && vall1 == 1 && vall2 == 1) || 
+        (val == 1 && valr1 == 0 && valr2 == 0 && vall1 == 1 && vall2 == 1) || 
+        (val == 1 && valr1 == 1 && valr2 == 0 && vall1 == 0 && vall2 == 1)) {
+        Serial.println("FORWARD");
+        analogWrite(m1, forward_speed);
+        analogWrite(m2, 0);
+        analogWrite(m3, forward_speed);
+        analogWrite(m4, 0);
+    } 
+    // Slight right
+    else if ((val == 1 && valr1 == 0 && valr2 == 1 && vall1 == 1 && vall2 == 1) ||
+             (val == 0 && valr1 == 0 && valr2 == 1 && vall1 == 1 && vall2 == 1)) {
+        Serial.println("SLIGHT RIGHT");
+        analogWrite(m1, 120);
+        analogWrite(m2, 0);
+        analogWrite(m3, 0);
+        analogWrite(m4, 0);
+    } 
+    // Slight left
+    else if ((val == 1 && valr1 == 1 && valr2 == 1 && vall1 == 0 && vall2 == 1) ||
+             (val == 1 && valr1 == 1 && valr2 == 1 && vall1 == 0 && vall2 == 0)) {
+        Serial.println("SLIGHT LEFT");
+        analogWrite(m1, 0);
+        analogWrite(m2, 0);
+        analogWrite(m3, 120);
+        analogWrite(m4, 0);
+    }
+    // Turn right
+    else if (turnedRight == 0 && val == 0 && valr1 == 0 && valr2 == 0 && rblock == 0) {
+        Serial.println("TURN RIGHT");
+        turnRobot(1);
+        delay(1000);
+        digitalWrite(A0, HIGH);
+        turnBack(1);
+        turnedRight = 1;
+        r = 1;
+    } 
+    // Skipping right
+    else if (turnedRight == 1 && val == 0 && valr1 == 0 && valr2 == 0) {
+        Serial.println("SKIPPING RIGHT");
+        analogWrite(m1, forward_speed);
+        analogWrite(m2, 0);
+        analogWrite(m3, forward_speed);
+        analogWrite(m4, 0);
+    } 
+    // Turn left
+    else if (turnedLeft == 0 && valr2 == 0 && vall1 == 0 && vall2 == 0 && lblock == 0) {
+        Serial.println("TURN LEFT");
+        turnRobot(-1);
+        delay(1000);
+        digitalWrite(A0, HIGH);
+        turnBack(-1);
+        turnedLeft = 1;
+    } 
+    // Skipping left
+    else if (turnedLeft == 1 && valr2 == 0 && vall1 == 0 && vall2 == 0) {
+        Serial.println("SKIPPING LEFT");
+        turnedRight = (r == 0) ? 0 : 1;
+        analogWrite(m1, forward_speed);
+        analogWrite(m2, 0);
+        analogWrite(m3, forward_speed);
+        analogWrite(m4, 0);
+    } 
+    // Stop if no valid path
+    else {
+        Serial.println("WAIT");
+        analogWrite(m1, 0);
+        analogWrite(m2, 0);
+        analogWrite(m3, 0);
+        analogWrite(m4, 0);
+    }
+}

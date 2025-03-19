@@ -1,0 +1,513 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+#include <ArduinoJson.h>
+#include <ESP32Servo.h>
+
+Servo myServo;
+
+// Access Point credentialsinclude <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128  // OLED display width
+#define SCREEN_HEIGHT 64  // OLED display height
+#define OLED_RESET    -1  // Reset pin (not used with I2C)
+#define SCREEN_ADDRESS 0x3C  // I2C address of OLED (common for SSD1306)
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+void setup() {
+  Wire.begin();
+  
+  // Initialize OLED
+  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) { 
+    Serial.println(F("SSD1306 allocation failed"));
+    for(;;);
+  }
+
+  display.clearDisplay();
+  
+  // Display text
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10, 20);
+  display.println("Hello!");
+  display.display();  
+}
+
+void loop() {
+  // Nothing here
+}
+const char* ssid = "ESP32-AP";
+const char* password = "12345678";  // At least 8 characters
+
+// GPIO Pins
+const int PIN_13 = 14;  // Lock/Unlock mode detection
+const int PIN_14 = 12;
+const int PIN_15 = 13;
+
+// Server instances
+WebServer server(80);
+WebSocketsServer webSocket = WebSocketsServer(81);
+
+// Track pin states and mode
+bool pin14State = false;
+bool pin15State = false;
+bool lastLockMode = false;
+bool currentLockMode = false;
+
+// Servo control variables
+unsigned long lastServoCheckTime = 0;
+const unsigned long servoCheckInterval = 100; // Check pin 4 every 100ms
+bool servoInAction = false;
+unsigned long servoActionStartTime = 0;
+int servoState = 0; // 0: idle, 1: first position, 2: second position
+
+// HTML for the web page (both modes in one page, toggled with JavaScript)
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32 Real-Time Control</title>
+  <style>
+    html {font-family: Arial; display: inline-block; text-align: center;}
+    h2 {font-size: 2.4rem;}
+    body {max-width: 600px; margin: 0px auto; padding: 20px;}
+    .button {
+      border: none;
+      color: white;
+      padding: 16px 40px;
+      text-decoration: none;
+      font-size: 24px;
+      margin: 10px;
+      cursor: pointer;
+      border-radius: 8px;
+      width: 80%;
+      transition: all 0.3s ease;
+    }
+    .unlock-button {
+      background-color: #4CAF50;
+    }
+    .unlock-button:active {
+      background-color: #3e8e41;
+    }
+    .lock-button {
+      background-color: #f44336;
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    .status {
+      margin-top: 30px;
+      padding: 10px;
+      background-color: #f1f1f1;
+      border-radius: 8px;
+    }
+    .mode-badge {
+      display: inline-block;
+      padding: 5px 10px;
+      border-radius: 15px;
+      font-size: 14px;
+      margin-bottom: 20px;
+      color: white;
+      transition: background-color 0.3s ease;
+    }
+    .unlock-mode {
+      background-color: #4CAF50;
+    }
+    .lock-mode {
+      background-color: #f44336;
+    }
+    .hidden {
+      display: none;
+    }
+    .pin-status {
+      display: inline-block;
+      width: 15px;
+      height: 15px;
+      border-radius: 50%;
+      margin-right: 5px;
+      background-color: #ccc;
+    }
+    .pin-high {
+      background-color: #4CAF50;
+    }
+    .connection-status {
+      position: fixed;
+      top: 10px;
+      right: 10px;
+      padding: 5px 10px;
+      border-radius: 15px;
+      font-size: 12px;
+    }
+    .connected {
+      background-color: #4CAF50;
+      color: white;
+    }
+    .disconnected {
+      background-color: #f44336;
+      color: white;
+    }
+    .lock-notice {
+      color: #f44336;
+      font-weight: bold;
+      margin-top: 10px;
+    }
+  </style>
+</head>
+<body>
+  <div id="connection-status" class="connection-status disconnected">Disconnected</div>
+  
+  <h2>Warehouse managment</h2>
+  <div id="mode-badge" class="mode-badge unlock-mode">UNLOCK MODE</div>
+  
+  <!-- Unlock Mode Controls -->
+  <div id="unlock-controls">
+    <p>Control GPIO pins 14 and 15</p>
+    
+    <p><button class="button unlock-button" onclick="sendCommand('gpio14')">
+      SPACE 1 <span id="pin14-status" class="pin-status"></span>
+    </button></p>
+    
+    <p><button class="button unlock-button" onclick="sendCommand('gpio15')">
+      SPACE 2 <span id="pin15-status" class="pin-status"></span>
+    </button></p>
+    
+    <p><button class="button unlock-button" onclick="sendCommand('both')">
+      SPACE 3
+    </button></p>
+  </div>
+  
+  <!-- Lock Mode Controls (Disabled) -->
+  <div id="lock-controls" class="hidden">
+    <p>Lock Mode Controls</p>
+    <p class="lock-notice">CONTROLS DISABLED IN LOCK MODE</p>
+    
+    <p><button class="button lock-button" disabled>
+      Lock Button 1
+    </button></p>
+    
+    <p><button class="button lock-button" disabled>
+      Lock Button 2
+    </button></p>
+    
+    <p><button class="button lock-button" disabled>
+      Lock Button 3
+    </button></p>
+  </div>
+  
+  <div class="status">
+    <p id="status">Status: Connecting...</p>
+    <p id="mode-status">Waiting for mode information...</p>
+  </div>
+  
+  <script>
+    var gateway = ws://${window.location.hostname}:81;
+    var websocket;
+    
+    // Initialize WebSocket connection
+    function initWebSocket() {
+      console.log('Trying to open a WebSocket connection...');
+      websocket = new WebSocket(gateway);
+      websocket.onopen = onOpen;
+      websocket.onclose = onClose;
+      websocket.onmessage = onMessage;
+    }
+    
+    // When WebSocket connection is established
+    function onOpen(event) {
+      console.log('Connection opened');
+      document.getElementById('connection-status').className = 'connection-status connected';
+      document.getElementById('connection-status').innerHTML = 'Connected';
+      document.getElementById('status').innerHTML = 'Status: Connected to ESP32';
+    }
+    
+    // When WebSocket connection is closed
+    function onClose(event) {
+      console.log('Connection closed');
+      document.getElementById('connection-status').className = 'connection-status disconnected';
+      document.getElementById('connection-status').innerHTML = 'Disconnected';
+      document.getElementById('status').innerHTML = 'Status: Connection lost. Reconnecting...';
+      // Try to reconnect after 2 seconds
+      setTimeout(initWebSocket, 2000);
+    }
+    
+    // When a message is received from the server
+    function onMessage(event) {
+      var data = JSON.parse(event.data);
+      console.log('Data received:', data);
+      
+      // Update lock/unlock mode
+      if (data.lockMode !== undefined) {
+        updateMode(data.lockMode);
+      }
+      
+      // Update pin states
+      if (data.pin14 !== undefined) {
+        updatePinStatus('pin14-status', data.pin14);
+      }
+      
+      if (data.pin15 !== undefined) {
+        updatePinStatus('pin15-status', data.pin15);
+      }
+      
+      // Update status message if provided
+      if (data.status) {
+        document.getElementById('status').innerHTML = 'Status: ' + data.status;
+      }
+    }
+    
+    // Update the UI based on lock/unlock mode
+    function updateMode(isLockMode) {
+      var modeBadge = document.getElementById('mode-badge');
+      var unlockControls = document.getElementById('unlock-controls');
+      var lockControls = document.getElementById('lock-controls');
+      var modeStatus = document.getElementById('mode-status');
+      
+      if (isLockMode) {
+        modeBadge.className = 'mode-badge lock-mode';
+        modeBadge.innerHTML = 'LOCK MODE';
+        unlockControls.className = 'hidden';
+        lockControls.className = '';
+        modeStatus.innerHTML = 'System is in LOCK mode (GPIO 13 HIGH) - Controls disabled';
+      } else {
+        modeBadge.className = 'mode-badge unlock-mode';
+        modeBadge.innerHTML = 'UNLOCK MODE';
+        unlockControls.className = '';
+        lockControls.className = 'hidden';
+        modeStatus.innerHTML = 'System is in UNLOCK mode (GPIO 13 LOW) - Controls enabled';
+      }
+    }
+    
+    // Update pin status indicators
+    function updatePinStatus(elementId, isHigh) {
+      var element = document.getElementById(elementId);
+      if (isHigh) {
+        element.className = 'pin-status pin-high';
+      } else {
+        element.className = 'pin-status';
+      }
+    }
+    
+    // Send a command to the server
+    function sendCommand(command) {
+      if (websocket.readyState === WebSocket.OPEN) {
+        websocket.send(command);
+      } else {
+        document.getElementById('status').innerHTML = 'Status: Connection lost. Reconnecting...';
+        initWebSocket();
+      }
+    }
+    
+    // Start WebSocket connection when page loads
+    window.addEventListener('load', initWebSocket);
+  </script>
+</body>
+</html>
+)rawliteral";
+
+void setup() {
+  // Initialize serial communication
+  Serial.begin(115200);
+  
+  // Set GPIO pins
+  pinMode(PIN_13, INPUT_PULLUP);  // Input with pull-up for lock/unlock detection
+  pinMode(PIN_14, OUTPUT);
+  pinMode(PIN_15, OUTPUT);
+
+  // Setup servo
+  myServo.attach(5);  
+  pinMode(4, INPUT);
+  
+  // Set initial state to LOW
+  digitalWrite(PIN_14, LOW);
+  digitalWrite(PIN_15, LOW);
+  
+  // Configure Access Point
+  WiFi.softAP(ssid, password);
+  
+  // Print IP address
+  IPAddress IP = WiFi.softAPIP();
+  Serial.print("AP IP address: ");
+  Serial.println(IP);
+  
+  // Define server routes
+  server.on("/", HTTP_GET, handleRoot);
+  
+  // Start server
+  server.begin();
+  Serial.println("HTTP server started");
+  
+  // Start WebSocket server
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+  Serial.println("WebSocket server started");
+  
+  // Initialize lock mode
+  currentLockMode = (digitalRead(PIN_13) == HIGH);
+  lastLockMode = currentLockMode;
+}
+
+void loop() {
+  server.handleClient();
+  webSocket.loop();
+  
+  // Check if lock mode has changed
+  currentLockMode = (digitalRead(PIN_13) == HIGH);
+  if (currentLockMode != lastLockMode) {
+    lastLockMode = currentLockMode;
+    
+    // If switching to lock mode, turn off all pins
+    if (currentLockMode) {
+      digitalWrite(PIN_14, LOW);
+      digitalWrite(PIN_15, LOW);
+      pin14State = false;
+      pin15State = false;
+    }
+    
+    notifyClients();
+  }
+  
+  // Non-blocking servo control
+  unsigned long currentMillis = millis();
+  
+  // Check pin 4 state periodically without blocking
+  if (currentMillis - lastServoCheckTime >= servoCheckInterval) {
+    lastServoCheckTime = currentMillis;
+    
+    if (digitalRead(4) == HIGH && !servoInAction) {
+      // Start servo action sequence
+      Serial.println("Pin 4 HIGH - Starting servo sequence");
+      servoInAction = true;
+      servoActionStartTime = currentMillis;
+      servoState = 1;
+      myServo.write(20); // Move to first position
+    }
+  }
+  
+  // Handle servo action states without blocking
+  if (servoInAction) {
+    unsigned long elapsedTime = currentMillis - servoActionStartTime;
+    
+    if (servoState == 1 && elapsedTime >= 4000) {
+      // After 4 seconds in first position, move to second position
+      myServo.write(90);
+      servoState = 2;
+      servoActionStartTime = currentMillis; // Reset timer for next state
+    }
+    else if (servoState == 2 && elapsedTime >= 15000) {
+      // After 15 seconds in second position, end sequence
+      servoInAction = false;
+      servoState = 0;
+      Serial.println("Servo sequence completed");
+    }
+  }
+  
+  // Add a small delay to prevent CPU hogging
+  delay(10);
+}
+
+// Handle root path - serves the HTML
+void handleRoot() {
+  server.send(200, "text/html", index_html);
+}
+
+// Handle WebSocket events
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.printf("[%u] Disconnected!\n", num);
+      break;
+    
+    case WStype_CONNECTED:
+      {
+        IPAddress ip = webSocket.remoteIP(num);
+        Serial.printf("[%u] Connected from %d.%d.%d.%d\n", num, ip[0], ip[1], ip[2], ip[3]);
+        
+        // Send current state to newly connected client
+        notifyClient(num);
+      }
+      break;
+    
+    case WStype_TEXT:
+      {
+        Serial.printf("[%u] Received text: %s\n", num, payload);
+        String command = String((char*)payload);
+        
+        // Only process commands in unlock mode
+        if (!currentLockMode) {
+          if (command == "gpio14") {
+            pin14State = !pin14State;
+            pin15State = false;
+            digitalWrite(PIN_14, pin14State ? HIGH : LOW);
+            digitalWrite(PIN_15, LOW);
+            notifyClients();
+          }
+          else if (command == "gpio15") {
+            pin14State = false;
+            pin15State = !pin15State;
+            digitalWrite(PIN_14, LOW);
+            digitalWrite(PIN_15, pin15State ? HIGH : LOW);
+            notifyClients();
+          }
+          else if (command == "both") {
+            pin14State = true;
+            pin15State = true;
+            digitalWrite(PIN_14, HIGH);
+            digitalWrite(PIN_15, HIGH);
+            notifyClients();
+          }
+        } else {
+          // In lock mode, ignore all commands but notify the client
+          String message = "Commands disabled in lock mode";
+          DynamicJsonDocument doc(1024);
+          doc["status"] = message;
+          doc["lockMode"] = currentLockMode;
+          doc["pin14"] = pin14State;
+          doc["pin15"] = pin15State;
+          
+          String jsonString;
+          serializeJson(doc, jsonString);
+          webSocket.sendTXT(num, jsonString);
+        }
+      }
+      break;
+  }
+}
+
+// Notify all connected clients about state changes
+void notifyClients() {
+  DynamicJsonDocument doc(1024);
+  doc["lockMode"] = currentLockMode;
+  doc["pin14"] = pin14State;
+  doc["pin15"] = pin15State;
+  
+  if (currentLockMode) {
+    doc["status"] = "Lock mode active - Controls disabled";
+  } else {
+    doc["status"] = "Unlock mode active - Controls enabled";
+  }
+  
+  String jsonString;
+  serializeJson(doc, jsonString);
+  webSocket.broadcastTXT(jsonString);
+}
+
+// Notify a specific client about current state
+void notifyClient(uint8_t num) {
+  DynamicJsonDocument doc(1024);
+  doc["lockMode"] = currentLockMode;
+  doc["pin14"] = pin14State;
+  doc["pin15"] = pin15State;
+  
+  if (currentLockMode) {
+    doc["status"] = "Lock mode active - Controls disabled";
+  } else {
+    doc["status"] = "Unlock mode active - Controls enabled";
+  }
+  
+  String jsonString;
+  serializeJson(doc, jsonString);
+  webSocket.sendTXT(num, jsonString);
+}
